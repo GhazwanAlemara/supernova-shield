@@ -1,0 +1,33 @@
+{
+  "name": "supernova-shield",
+  "version": "1.0.0",
+  "description": "Open-source self-hosted MCP Security Firewall & AI Spend-Cap Proxy for Claude Desktop, Cursor, Windsurf & LangChain.",
+  "main": "src/firewall.js",
+  "bin": {
+    "supernova-shield": "./bin/supernova-shield.js"
+  },
+  "scripts": {
+    "test": "node ./bin/supernova-shield.js demo"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "ai-security",
+    "prompt-injection",
+    "firewall",
+    "claude",
+    "cursor",
+    "supernova",
+    "cyberagents"
+  ],
+  "author": "Data Genius LLC <ghazwan@supernova.cool>",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/GhazwanAlemara/supernova-shield.git"
+  },
+  "homepage": "https://supernova.cool/open",
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
