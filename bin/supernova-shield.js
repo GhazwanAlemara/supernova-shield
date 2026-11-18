@@ -2,8 +2,10 @@
 "use strict";
 
 const { spawn } = require("child_process");
+const http = require("http");
 const https = require("https");
 const readline = require("readline");
+const { URL } = require("url");
 const {
   BudgetTracker,
   appendAuditEntry,
@@ -12,7 +14,16 @@ const {
   saveApiKey
 } = require("../src/firewall");
 
-const SUPERNOVA_BASE = (process.env.SUPERNOVA_API_URL || "https://supernova.cool").replace(/\/+$/, "");
+const RAW_SUPERNOVA_BASE = (process.env.SUPERNOVA_API_URL || "https://supernova.cool").replace(/\/+$/, "");
+const SUPERNOVA_BASE = (
+  RAW_SUPERNOVA_BASE.startsWith("https://") ||
+  RAW_SUPERNOVA_BASE.startsWith("http://localhost") ||
+  RAW_SUPERNOVA_BASE.startsWith("http://127.0.0.1")
+)
+  ? RAW_SUPERNOVA_BASE
+  : "https://supernova.cool";
+
+const INSPECTED_MCP_METHODS = new Set(["tools/call", "resources/read", "prompts/get"]);
 
 function printConnectedFooter(apiKey) {
   if (!apiKey) {
@@ -69,12 +80,65 @@ function runDemo() {
   printConnectedFooter(loadSavedApiKey());
 }
 
+function inspectSingleJsonRpc(msg, tracker) {
+  if (!msg || typeof msg !== "object" || Array.isArray(msg)) {
+    return {
+      ok: false,
+      errorResp: { jsonrpc: "2.0", id: null, error: { code: -32600, message: "Invalid JSON-RPC request object" } }
+    };
+  }
+  const method = String(msg.method || "");
+  if (!INSPECTED_MCP_METHODS.has(method)) {
+    return { ok: true };
+  }
+
+  const scan = inspectPayload(msg.params || {});
+  if (scan.blocked) {
+    appendAuditEntry({ action: "mcp_block", method, tool: msg.params?.name || msg.params?.uri, ...scan });
+    return {
+      ok: false,
+      errorResp: {
+        jsonrpc: "2.0",
+        id: msg.id ?? null,
+        error: {
+          code: -32001,
+          message: `Blocked by Supernova Shield (${scan.findings[0]?.rule_id || "POLICY_VIOLATION"})`,
+          data: scan
+        }
+      }
+    };
+  }
+
+  if (method === "tools/call") {
+    const cap = tracker.canExecute();
+    if (!cap.allowed) {
+      appendAuditEntry({ action: "budget_block", method, tool: msg.params?.name, reason: cap.reason });
+      return {
+        ok: false,
+        errorResp: {
+          jsonrpc: "2.0",
+          id: msg.id ?? null,
+          error: { code: -32002, message: cap.reason, data: cap }
+        }
+      };
+    }
+  }
+
+  appendAuditEntry({ action: "mcp_allow", method, tool: msg.params?.name || msg.params?.uri, payload_sha256: scan.payload_sha256 });
+  return { ok: true };
+}
+
 function runWrap(args) {
   let budgetUsd = 5.0;
   let cmdArgs = [...args];
   const bIdx = cmdArgs.indexOf("--budget");
-  if (bIdx !== -1 && cmdArgs[bIdx + 1]) {
-    budgetUsd = Number(cmdArgs[bIdx + 1]) || 5.0;
+  if (bIdx !== -1) {
+    const parsed = Number(cmdArgs[bIdx + 1]);
+    if (!Number.isFinite(parsed) || parsed <= 0) {
+      console.error("Invalid --budget value: must be a positive USD number > 0.");
+      process.exit(2);
+    }
+    budgetUsd = parsed;
     cmdArgs.splice(bIdx, 2);
   }
   const sepIdx = cmdArgs.indexOf("--");
@@ -91,6 +155,21 @@ function runWrap(args) {
 
   const rlChild = readline.createInterface({ input: child.stdout });
   rlChild.on("line", (line) => {
+    const trimmed = line.trim();
+    if (trimmed) {
+      const outScan = inspectPayload(trimmed);
+      if (outScan.blocked && outScan.findings.some((f) => f.rule_id === "SECRET_EXFILTRATION_LEAK")) {
+        appendAuditEntry({ action: "stdout_secret_redact", findings: outScan.findings });
+        process.stderr.write("[Supernova Shield] Redacted downstream secret leakage in MCP response.\n");
+        const errOut = {
+          jsonrpc: "2.0",
+          id: null,
+          error: { code: -32003, message: "MCP response redacted due to credential leak detection." }
+        };
+        process.stdout.write(JSON.stringify(errOut) + "\n");
+        return;
+      }
+    }
     process.stdout.write(line + "\n");
   });
 
@@ -102,41 +181,34 @@ function runWrap(args) {
     try {
       msg = JSON.parse(trimmed);
     } catch (_) {
+      const errResp = {
+        jsonrpc: "2.0",
+        id: null,
+        error: { code: -32700, message: "Parse error rejected by Supernova Shield proxy" }
+      };
+      process.stdout.write(JSON.stringify(errResp) + "\n");
+      return;
+    }
+
+    if (Array.isArray(msg)) {
+      const errors = [];
+      for (const item of msg) {
+        const res = inspectSingleJsonRpc(item, tracker);
+        if (!res.ok) errors.push(res.errorResp);
+      }
+      if (errors.length > 0) {
+        process.stdout.write(JSON.stringify(errors.length === 1 ? errors[0] : errors) + "\n");
+        return;
+      }
       child.stdin.write(line + "\n");
       return;
     }
 
-    if (msg.method === "tools/call") {
-      const scan = inspectPayload(msg.params || {});
-      if (scan.blocked) {
-        appendAuditEntry({ action: "mcp_block", method: msg.method, tool: msg.params?.name, ...scan });
-        const errResp = {
-          jsonrpc: "2.0",
-          id: msg.id ?? null,
-          error: {
-            code: -32001,
-            message: `Blocked by Supernova Shield (${scan.findings[0]?.rule_id || "POLICY_VIOLATION"})`,
-            data: scan
-          }
-        };
-        process.stdout.write(JSON.stringify(errResp) + "\n");
-        return;
-      }
-
-      const cap = tracker.canExecute();
-      if (!cap.allowed) {
-        appendAuditEntry({ action: "budget_block", method: msg.method, tool: msg.params?.name, reason: cap.reason });
-        const errResp = {
-          jsonrpc: "2.0",
-          id: msg.id ?? null,
-          error: { code: -32002, message: cap.reason, data: cap }
-        };
-        process.stdout.write(JSON.stringify(errResp) + "\n");
-        return;
-      }
-      appendAuditEntry({ action: "mcp_allow", method: msg.method, tool: msg.params?.name, payload_sha256: scan.payload_sha256 });
+    const res = inspectSingleJsonRpc(msg, tracker);
+    if (!res.ok) {
+      process.stdout.write(JSON.stringify(res.errorResp) + "\n");
+      return;
     }
-
     child.stdin.write(line + "\n");
   });
 
@@ -150,11 +222,13 @@ function runActivate(args) {
     process.exit(2);
   }
   saveApiKey(key);
-  const req = https.request(
-    `${SUPERNOVA_BASE}/api/v1/discovery/open/status`,
+  const targetUrl = new URL(`${SUPERNOVA_BASE}/api/v1/discovery/open/status`);
+  const transport = targetUrl.protocol === "http:" ? http : https;
+  const req = transport.request(
+    targetUrl,
     {
       method: "GET",
-      headers: { "X-Supernova-Key": key, "User-Agent": "supernova-shield/1.0.0" },
+      headers: { Authorization: `Bearer ${key}`, "User-Agent": "supernova-shield/1.0.0" },
       timeout: 5000
     },
     (res) => {
