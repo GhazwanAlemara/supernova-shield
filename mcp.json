@@ -1,0 +1,21 @@
+{
+  "$schema": "https://modelcontextprotocol.io/schema/mcp.json",
+  "mcpServers": {
+    "supernova": {
+      "type": "streamableHttp",
+      "url": "https://supernova.cool/api/v1/mcp/",
+      "headers": {
+        "X-Supernova-Key": "${SUPERNOVA_API_KEY}"
+      },
+      "description": "Supernova MCP Marketplace Gateway & AEGIS Trust Clearinghouse. Claim a Free Community Key ($5 credit + Shield rule sync) at https://supernova.cool/open."
+    },
+    "cyber-agents": {
+      "type": "streamableHttp",
+      "url": "https://cyberagents.app/mcp",
+      "headers": {
+        "Authorization": "Bearer ${CYBERAGENTS_API_KEY}"
+      },
+      "description": "CyberAgents AI Firewall & Prompt-Injection Inspector. Test free payloads at https://cyberagents.app/open."
+    }
+  }
+}
